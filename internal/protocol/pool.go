@@ -47,7 +47,7 @@ type Pool struct {
 	db  *store.DB
 
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]chan struct{}
 	// codeLocks serialize wx.login requests for one account. Different
 	// accounts keep running concurrently, while a single account cannot have
 	// two one-time login codes consumed at the same time.
@@ -80,7 +80,7 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	return &Pool{
 		cfg:          cfg,
 		db:           db,
-		locks:        map[string]*sync.Mutex{},
+		locks:        map[string]chan struct{}{},
 		codeLocks:    map[int64]chan struct{}{},
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
@@ -114,12 +114,41 @@ func (p *Pool) getCode(ctx context.Context, loginBuffer, appID string, accountID
 		}
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
 	}
-	result, err := p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call)
-	if err != nil || result["code"] != "" {
+	return retryLoginCode(ctx, func() (map[string]any, error) {
+		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call)
+	}, func() error {
+		if err := p.Invalidate(ctx, accountID, tcpProxy); err != nil {
+			return err
+		}
+		if tcpProxy != "" && fallbackDirect {
+			return p.Invalidate(ctx, accountID, "")
+		}
+		return nil
+	})
+}
+
+// Only wx.login may rebuild a stale session and retry once. Never replay
+// arbitrary OperateWXData operations, which can have side effects.
+func retryLoginCode(ctx context.Context, call func() (map[string]any, error), invalidate func() error) (map[string]any, error) {
+	result, err := call()
+	emptyCode := err == nil && (result == nil || result["code"] == nil || result["code"] == "")
+	if !emptyCode && !errors.Is(err, ErrShortlinkPayload) {
 		return result, err
 	}
-	_ = p.Invalidate(ctx, accountID, tcpProxy)
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if resetErr := invalidate(); resetErr != nil {
+		return nil, fmt.Errorf("reset code session: %w", resetErr)
+	}
+	result, err = call()
+	if err != nil {
+		return nil, fmt.Errorf("code retry after session rebuild failed: %w", err)
+	}
+	if result == nil || result["code"] == nil || result["code"] == "" {
+		return nil, fmt.Errorf("wx.login returned empty code after session rebuild")
+	}
+	return result, nil
 }
 
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool) (map[string]any, error) {
@@ -180,14 +209,19 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 }
 
 func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool) (WmpfSession, error) {
+	// Include the queue wait in the login budget, not just the socket work.
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
+	defer cancel()
 	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
 		return sessionFromBlob(row.SessionBlob)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
 	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, tcpProxy))
-	lock.Lock()
-	defer lock.Unlock()
+	if err := acquire(ctx, lock); err != nil {
+		return WmpfSession{}, err
+	}
+	defer release(lock)
 	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
 		return sessionFromBlob(row.SessionBlob)
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -201,9 +235,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 		return WmpfSession{}, err
 	}
 	defer release(p.loginSem)
-	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
-	defer cancel()
-	st, err := p.loginAndSession(loginCtx, loginBuffer, tcpProxy, fallbackDirect)
+	st, err := p.loginAndSession(ctx, loginBuffer, tcpProxy, fallbackDirect)
 	if err != nil {
 		return WmpfSession{}, err
 	}
@@ -217,13 +249,13 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	return st, nil
 }
 
-func (p *Pool) lockFor(key string) *sync.Mutex {
+func (p *Pool) lockFor(key string) chan struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if l := p.locks[key]; l != nil {
 		return l
 	}
-	l := &sync.Mutex{}
+	l := make(chan struct{}, 1)
 	p.locks[key] = l
 	return l
 }
@@ -250,6 +282,9 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	targets = orderLonglinkTargets(targets, 6)
 	var last error
 	for _, t := range targets {
+		if err := ctx.Err(); err != nil {
+			return WmpfSession{}, fmt.Errorf("LongLink login cancelled: %w", err)
+		}
 		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, fallbackDirect)
 		if err != nil {
 			last = err
